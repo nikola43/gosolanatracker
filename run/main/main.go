@@ -174,56 +174,61 @@ func main() {
 						continue
 					}
 
-					if swapInfo != nil {
-						foundData = true
-
-						transactionInfo := models.Trade{
-							Type:            ".",
-							DexProvider:     swapInfo.AMMs[0],
-							Timestamp:       time.Now().Unix(),
-							WalletAddress:   swapInfo.Signers[0].String(),
-							TokenInAddress:  swapInfo.TokenInMint.String(),
-							TokenOutAddress: swapInfo.TokenOutMint.String(),
-							TokenInAmount:   parseTokenAmount(swapInfo.TokenInAmount, swapInfo.TokenInDecimals).String(),
-							TokenOutAmount:  parseTokenAmount(swapInfo.TokenOutAmount, swapInfo.TokenOutDecimals).String(),
-							TxID:            signature.String(),
-						}
-
-						requestBody, err := json.Marshal(transactionInfo)
-						if err != nil {
-							fmt.Println("Error marshalling JSON:", err)
-							return
-						}
-
-						// Send the transaction data to API
-						req, err := http.NewRequest("POST", API_URL, bytes.NewBuffer(requestBody))
-						if err != nil {
-							fmt.Println("Error creating request:", err)
-							return
-						}
-
-						req.Header.Set("Content-Type", "application/json")
-
-						client := &http.Client{}
-						resp, err := client.Do(req)
-						if err != nil {
-							fmt.Println("Error sending request:", err)
-							return
-						}
-						defer resp.Body.Close()
-
-						body, err := ioutil.ReadAll(resp.Body)
-						if err != nil {
-							fmt.Println("Error reading response:", err)
-							return
-						}
-
-						fmt.Println("Response:", string(body))
+					if swapInfo == nil {
+						fmt.Println("No swap data found, retrying...")
+						retry++
+						time.Sleep(10 * time.Second)
+						continue
 					}
 
-					if foundData {
-						break
+					foundData = true
+
+					// Process the transaction only if swapInfo is not nil
+					transactionInfo := models.Trade{
+						Type:            ".",
+						DexProvider:     swapInfo.AMMs[0],
+						Timestamp:       time.Now().Unix(),
+						WalletAddress:   swapInfo.Signers[0].String(),
+						TokenInAddress:  swapInfo.TokenInMint.String(),
+						TokenOutAddress: swapInfo.TokenOutMint.String(),
+						TokenInAmount:   parseTokenAmount(swapInfo.TokenInAmount, swapInfo.TokenInDecimals).String(),
+						TokenOutAmount:  parseTokenAmount(swapInfo.TokenOutAmount, swapInfo.TokenOutDecimals).String(),
+						TxID:            signature.String(),
 					}
+
+					requestBody, err := json.Marshal(transactionInfo)
+					if err != nil {
+						fmt.Println("Error marshalling JSON:", err)
+						return
+					}
+
+					// Send the transaction data to API
+					req, err := http.NewRequest("POST", API_URL, bytes.NewBuffer(requestBody))
+					if err != nil {
+						fmt.Println("Error creating request:", err)
+						return
+					}
+
+					req.Header.Set("Content-Type", "application/json")
+
+					client := &http.Client{}
+					resp, err := client.Do(req)
+					if err != nil {
+						fmt.Println("Error sending request:", err)
+						return
+					}
+					defer resp.Body.Close()
+
+					body, err := ioutil.ReadAll(resp.Body)
+					if err != nil {
+						fmt.Println("Error reading response:", err)
+						return
+					}
+
+					fmt.Println("Response:", string(body))
+
+					// If you reached here, it means the transaction was successfully processed
+					break
 				}
 			}(notification.Value.Signature)
 		}
