@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
+	"math/big"
 	"net/http"
 	"os"
 	"runtime"
@@ -22,6 +24,12 @@ import (
 	"github.com/nikola43/solanatxtracker/db"
 	"github.com/nikola43/solanatxtracker/models"
 )
+
+func parseTokenAmount(amount uint64, decimals uint8) *big.Float {
+	amountFloat := new(big.Float).SetUint64(amount)
+	decimalFactor := new(big.Float).SetFloat64(math.Pow(10, float64(decimals)))
+	return new(big.Float).Quo(amountFloat, decimalFactor)
+}
 
 func parseTxData(rpcClient *rpc.Client, signature solana.Signature) (*solanaswapgo.SwapInfo, error) {
 	var maxTxVersion uint64 = 0
@@ -169,10 +177,10 @@ func main() {
 					DexProvider:     swapInfo.AMMs[0],
 					Timestamp:       time.Now().Unix(),
 					WalletAddress:   swapInfo.Signers[0].String(),
-					TokenInAddress:  swapInfo.TokenOutMint.String(),
-					TokenOutAddress: swapInfo.TokenInMint.String(),
-					TokenInAmount:   fmt.Sprintf("%d", swapInfo.TokenOutAmount),
-					TokenOutAmount:  fmt.Sprintf("%d", swapInfo.TokenInAmount),
+					TokenInAddress:  swapInfo.TokenInMint.String(),
+					TokenOutAddress: swapInfo.TokenOutMint.String(),
+					TokenInAmount:   parseTokenAmount(swapInfo.TokenInAmount, swapInfo.TokenInDecimals).String(),
+					TokenOutAmount:  parseTokenAmount(swapInfo.TokenOutAmount, swapInfo.TokenOutDecimals).String(),
 					TxID:            signature.String(),
 				}
 
