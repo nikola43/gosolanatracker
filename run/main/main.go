@@ -69,6 +69,44 @@ func parseTxData(rpcClient *rpc.Client, signature solana.Signature) (*solanaswap
 	return swapInfo, nil
 }
 
+// Helper function to send transaction data to API
+func sendTransactionToAPI(apiURL string, transactionInfo models.Trade) {
+	requestBody, err := json.Marshal(transactionInfo)
+	if err != nil {
+		fmt.Println("Error marshalling JSON:", err)
+		return
+	}
+
+	// Create a new HTTP request
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(requestBody))
+	if err != nil {
+		fmt.Println("Error creating request:", err)
+		return
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create an HTTP client and send the request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println("Error sending request:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read the response body
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Println("Error reading response:", err)
+		return
+	}
+
+	// Print the response
+	fmt.Printf("API Response for tx %s: %s\n", transactionInfo.TxID, string(body))
+}
+
 func main() {
 	// get environment variables
 	err := godotenv.Load()
@@ -153,38 +191,58 @@ func main() {
 	}
 
 	// Process notifications from the channel in parallel
-	go func() {
-		for notification := range notificationChan {
-			wg.Add(1) // Increment WaitGroup counter
 
-			go func(signature solana.Signature) {
-				defer wg.Done() // Decrement WaitGroup counter when done
+	// Create a semaphore to limit concurrent processing
+	// You can adjust this number based on your system capabilities
+	const maxConcurrent = 50
+	semaphore := make(chan struct{}, maxConcurrent)
 
-				retry := 1
-				maxRetries := 5
+	// Process notifications from the channel
+	for notification := range notificationChan {
+		// Acquire semaphore spot (will block if maxConcurrent is reached)
+		semaphore <- struct{}{}
 
-				for retry <= maxRetries {
-					fmt.Printf("Received notification for transaction: %s\n", signature)
-					swapInfo, err := parseTxData(rpcClient, signature)
-					if err != nil {
-						fmt.Println("Error parsing transaction data: ", err)
-						fmt.Println("Retrying in 10 seconds...")
+		// Process each transaction in its own goroutine
+		go func(notification *ws.LogResult) {
+			defer func() {
+				// Release the semaphore when done
+				<-semaphore
+			}()
+
+			signature := notification.Value.Signature
+			fmt.Printf("Received notification for transaction: %s\n", signature)
+
+			retry := 1
+			maxRetries := 5
+			for retry <= maxRetries {
+				swapInfo, err := parseTxData(rpcClient, signature)
+				if err != nil {
+					fmt.Printf("Error parsing transaction data for %s: %v\n", signature, err)
+					if retry < maxRetries {
+						fmt.Printf("Retrying %s in 10 seconds... (Attempt %d/%d)\n",
+							signature, retry, maxRetries)
 						retry++
 						time.Sleep(10 * time.Second)
 						continue
 					}
+					fmt.Printf("Giving up on transaction %s after %d attempts\n",
+						signature, maxRetries)
+					return
+				}
 
-					if swapInfo == nil {
-						fmt.Println("No swap data found, retrying...")
-						retry++
-						time.Sleep(10 * time.Second)
-						continue
-					}
+				WSOL := "So11111111111111111111111111111111111111112"
+				USDC := "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+				USDT := "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 
+				tradeType := "BUY"
+				if swapInfo.TokenOutMint.String() == WSOL || swapInfo.TokenOutMint.String() == USDC || swapInfo.TokenOutMint.String() == USDT {
+					tradeType = "SELL"
+				}
 
-					// Process the transaction only if swapInfo is not nil
+				if swapInfo != nil {
+					// Process the swap info
 					transactionInfo := models.Trade{
-						Type:            ".",
+						Type:            tradeType,
 						DexProvider:     swapInfo.AMMs[0],
 						Timestamp:       time.Now().Unix(),
 						WalletAddress:   swapInfo.Signers[0].String(),
@@ -195,43 +253,13 @@ func main() {
 						TxID:            signature.String(),
 					}
 
-					requestBody, err := json.Marshal(transactionInfo)
-					if err != nil {
-						fmt.Println("Error marshalling JSON:", err)
-						return
-					}
-
-					// Send the transaction data to API
-					req, err := http.NewRequest("POST", API_URL, bytes.NewBuffer(requestBody))
-					if err != nil {
-						fmt.Println("Error creating request:", err)
-						return
-					}
-
-					req.Header.Set("Content-Type", "application/json")
-
-					client := &http.Client{}
-					resp, err := client.Do(req)
-					if err != nil {
-						fmt.Println("Error sending request:", err)
-						return
-					}
-					defer resp.Body.Close()
-
-					body, err := ioutil.ReadAll(resp.Body)
-					if err != nil {
-						fmt.Println("Error reading response:", err)
-						return
-					}
-
-					fmt.Println("Response:", string(body))
-
-					// If you reached here, it means the transaction was successfully processed
-					break
+					// Send the transaction to API
+					sendTransactionToAPI(API_URL, transactionInfo)
 				}
-			}(notification.Value.Signature)
-		}
-	}()
+				break
+			}
+		}(notification)
+	}
 
 	// Wait for all goroutines to finish processing
 	wg.Wait()
