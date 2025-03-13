@@ -2,7 +2,7 @@ package models
 
 type Trade struct {
 	ID              uint   `gorm:"primarykey" json:"id"`
-	TxID            string `json:"txid" gorm:"unique;size:88"`
+	TxID            string `json:"tx_id" gorm:"unique;size:88"`
 	Type            string `json:"type" gorm:"size:4"`
 	DexProvider     string `json:"dex_provider" gorm:"size:20"`
 	Timestamp       int64  `json:"timestamp"`
@@ -15,5 +15,5 @@ type Trade struct {
 
 type Wallets struct {
 	ID      uint   `gorm:"primarykey" json:"id"`
-	Address string `json:"txid" gorm:"unique;size:44"`
+	Address string `json:"address" gorm:"unique;size:44"`
 }
