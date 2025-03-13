@@ -53,7 +53,7 @@ func parseTokenAmount(amount uint64, decimals uint8) *big.Float {
 
 func main() {
 	rpcClient := rpc.New(rpc.MainNetBeta.RPC)
-	signature := solana.MustSignatureFromBase58("5YZtbCXqJ2BHo9kgvP5Um6gxLQkzfqvjJcSYbHCswC9EvgoCmLU1CQCJLG47cjAb5S4mRCBsFA1X7t74cV95CGVR")
+	signature := solana.MustSignatureFromBase58("4MAEMzMNjDB2fSdMmXwLKevEHJvN7zQz9GuKKyZrbcFuHW4AbpUDUEta1VNemGegUckTibdUwNt85fhzwhWFqvAD")
 
 	var maxTxVersion uint64 = 0
 	tx, err := rpcClient.GetTransaction(

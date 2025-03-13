@@ -13,7 +13,6 @@ import (
 	"os"
 	"runtime"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/fatih/color"
@@ -135,9 +134,6 @@ func main() {
 	// Create a channel to receive notifications
 	notificationChan := make(chan *ws.LogResult)
 
-	// Create a WaitGroup to track goroutines
-	var wg sync.WaitGroup
-
 	// Start a Goroutine for each subscription
 	for _, sub := range subscriptions {
 		go func(sub *ws.LogSubscription) {
@@ -152,83 +148,85 @@ func main() {
 		}(sub)
 	}
 
-	// Process notifications from the channel in parallel
-	go func() {
-		for notification := range notificationChan {
-			wg.Add(1) // Increment WaitGroup counter
+	// Process notifications from the channel
+	for notification := range notificationChan {
+		signature := notification.Value.Signature
 
-			go func(signature solana.Signature) {
-				defer wg.Done() // Decrement WaitGroup counter when done
+		retry := 1
+		maxRetries := 5
+		foundData := false
+		for retry <= maxRetries {
+			fmt.Printf("Received notification for transaction: %s\n", signature)
+			swapInfo, err := parseTxData(rpcClient, signature)
+			if err != nil {
+				fmt.Println("Error parsing transaction data: ", err)
+				fmt.Println("Retrying in 10 seconds...")
+				retry++
+				time.Sleep(10 * time.Second)
+				continue
+			}
 
-				retry := 1
-				maxRetries := 5
-				foundData := false
-				for retry <= maxRetries {
-					fmt.Printf("Received notification for transaction: %s\n", signature)
-					swapInfo, err := parseTxData(rpcClient, signature)
-					if err != nil {
-						fmt.Println("Error parsing transaction data: ", err)
-						fmt.Println("Retrying in 10 seconds...")
-						retry++
-						time.Sleep(10 * time.Second)
-						continue
-					}
+			if swapInfo != nil {
+				foundData = true
 
-					if swapInfo != nil {
-						foundData = true
+				// marshalledSwapData, _ := json.MarshalIndent(swapInfo, "", "  ")
+				// fmt.Println(string(marshalledSwapData))
 
-						transactionInfo := models.Trade{
-							Type:            ".",
-							DexProvider:     swapInfo.AMMs[0],
-							Timestamp:       time.Now().Unix(),
-							WalletAddress:   swapInfo.Signers[0].String(),
-							TokenInAddress:  swapInfo.TokenInMint.String(),
-							TokenOutAddress: swapInfo.TokenOutMint.String(),
-							TokenInAmount:   parseTokenAmount(swapInfo.TokenInAmount, swapInfo.TokenInDecimals).String(),
-							TokenOutAmount:  parseTokenAmount(swapInfo.TokenOutAmount, swapInfo.TokenOutDecimals).String(),
-							TxID:            signature.String(),
-						}
-
-						requestBody, err := json.Marshal(transactionInfo)
-						if err != nil {
-							fmt.Println("Error marshalling JSON:", err)
-							return
-						}
-
-						// Send the transaction data to API
-						req, err := http.NewRequest("POST", API_URL, bytes.NewBuffer(requestBody))
-						if err != nil {
-							fmt.Println("Error creating request:", err)
-							return
-						}
-
-						req.Header.Set("Content-Type", "application/json")
-
-						client := &http.Client{}
-						resp, err := client.Do(req)
-						if err != nil {
-							fmt.Println("Error sending request:", err)
-							return
-						}
-						defer resp.Body.Close()
-
-						body, err := ioutil.ReadAll(resp.Body)
-						if err != nil {
-							fmt.Println("Error reading response:", err)
-							return
-						}
-
-						fmt.Println("Response:", string(body))
-					}
-
-					if foundData {
-						break
-					}
+				transactionInfo := models.Trade{
+					Type:            ".",
+					DexProvider:     swapInfo.AMMs[0],
+					Timestamp:       time.Now().Unix(),
+					WalletAddress:   swapInfo.Signers[0].String(),
+					TokenInAddress:  swapInfo.TokenInMint.String(),
+					TokenOutAddress: swapInfo.TokenOutMint.String(),
+					TokenInAmount:   parseTokenAmount(swapInfo.TokenInAmount, swapInfo.TokenInDecimals).String(),
+					TokenOutAmount:  parseTokenAmount(swapInfo.TokenOutAmount, swapInfo.TokenOutDecimals).String(),
+					TxID:            signature.String(),
 				}
-			}(notification.Value.Signature)
-		}
-	}()
 
-	// Wait for all goroutines to finish processing
-	wg.Wait()
+				requestBody, err := json.Marshal(transactionInfo)
+				if err != nil {
+					fmt.Println("Error marshalling JSON:", err)
+					return
+				}
+
+				// insert transaction to API
+				// Create a new HTTP request
+				req, err := http.NewRequest("POST", API_URL, bytes.NewBuffer(requestBody))
+				if err != nil {
+					fmt.Println("Error creating request:", err)
+					return
+				}
+
+				// Set headers
+				req.Header.Set("Content-Type", "application/json")
+
+				// Create an HTTP client and send the request
+				client := &http.Client{}
+				resp, err := client.Do(req)
+				if err != nil {
+					fmt.Println("Error sending request:", err)
+					return
+				}
+				defer resp.Body.Close()
+
+				// Read the response body
+				body, err := ioutil.ReadAll(resp.Body)
+				if err != nil {
+					fmt.Println("Error reading response:", err)
+					return
+				}
+
+				// Print the response
+				fmt.Println("Response:", string(body))
+
+				// unmarshalledSwapData, _ := json.MarshalIndent(transactionInfo, "", "  ")
+				// fmt.Println(string(unmarshalledSwapData))
+			}
+
+			if foundData {
+				break
+			}
+		}
+	}
 }
