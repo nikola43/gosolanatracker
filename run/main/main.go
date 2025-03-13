@@ -162,7 +162,7 @@ func main() {
 
 				retry := 1
 				maxRetries := 5
-				foundData := false
+
 				for retry <= maxRetries {
 					fmt.Printf("Received notification for transaction: %s\n", signature)
 					swapInfo, err := parseTxData(rpcClient, signature)
@@ -181,7 +181,6 @@ func main() {
 						continue
 					}
 
-					foundData = true
 
 					// Process the transaction only if swapInfo is not nil
 					transactionInfo := models.Trade{
