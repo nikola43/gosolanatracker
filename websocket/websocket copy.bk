@@ -1,0 +1,453 @@
+package websocket
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/gagliardetto/solana-go/rpc"
+
+	"github.com/fatih/color"
+	"github.com/gagliardetto/solana-go"
+	"github.com/gagliardetto/solana-go/rpc/ws"
+	"github.com/nikola43/solanatxtracker/models"
+)
+
+// WebSocketManager manages WebSocket connections and reconnections
+// WebSocketManager manages WebSocket connections and reconnections
+type WebSocketManager struct {
+	RpcURL            string
+	WsURL             string
+	ApiURL            string
+	WalletPublicKeys  []solana.PublicKey
+	NotificationChan  chan *ws.LogResult
+	RpcClient         *rpc.Client
+	WsClient          *ws.Client
+	Subscriptions     []*ws.LogSubscription
+	ShutdownChan      chan struct{}
+	reconnectChan     chan struct{}
+	WgSubscriptions   sync.WaitGroup
+	ReconnectInterval time.Duration
+	MaxRetries        int
+	Mutex             sync.Mutex
+	Running           bool
+}
+
+// NewWebSocketManager creates a new WebSocketManager
+func NewWebSocketManager(rpcURL, wsURL, apiURL string, walletPublicKeys []solana.PublicKey) *WebSocketManager {
+	return &WebSocketManager{
+		RpcURL:            rpcURL,
+		WsURL:             wsURL,
+		ApiURL:            apiURL,
+		WalletPublicKeys:  walletPublicKeys,
+		NotificationChan:  make(chan *ws.LogResult, 100), // Buffer size to prevent blocking
+		ShutdownChan:      make(chan struct{}),
+		reconnectChan:     make(chan struct{}, 1), // Buffered channel to prevent blocking
+		ReconnectInterval: 10 * time.Second,
+		MaxRetries:        10,
+		Running:           false,
+	}
+}
+
+// Start starts the WebSocketManager
+func (wsm *WebSocketManager) Start() error {
+	wsm.Mutex.Lock()
+	if wsm.Running {
+		wsm.Mutex.Unlock()
+		return fmt.Errorf("WebSocketManager is already running")
+	}
+	wsm.Running = true
+	wsm.Mutex.Unlock()
+
+	wsm.RpcClient = rpc.New(wsm.RpcURL)
+
+	// Start connection monitor in a separate goroutine
+	go wsm.monitorAndReconnect()
+
+	// Trigger initial connection
+	wsm.triggerReconnect()
+
+	return nil
+}
+
+// Stop stops the WebSocketManager
+func (wsm *WebSocketManager) Stop() {
+	wsm.Mutex.Lock()
+	if !wsm.Running {
+		wsm.Mutex.Unlock()
+		return
+	}
+	wsm.Running = false
+	wsm.Mutex.Unlock()
+
+	// Signal shutdown
+	select {
+	case <-wsm.ShutdownChan:
+		// Channel already closed, do nothing
+	default:
+		close(wsm.ShutdownChan)
+	}
+
+	// Allow some time for goroutines to finish gracefully
+	time.Sleep(500 * time.Millisecond)
+
+	// Clean up connections under lock
+	wsm.Mutex.Lock()
+	wsm.cleanupConnectionsLocked()
+	wsm.Mutex.Unlock()
+
+	// Wait for all subscription handlers to finish
+	wsm.WgSubscriptions.Wait()
+
+	// Create fresh channels for next use
+	wsm.Mutex.Lock()
+	wsm.NotificationChan = make(chan *ws.LogResult, 100)
+	wsm.reconnectChan = make(chan struct{}, 1)
+	wsm.ShutdownChan = make(chan struct{})
+	wsm.Mutex.Unlock()
+}
+
+// cleanupConnectionsLocked cleans up WebSocket connections - must be called under mutex lock
+func (wsm *WebSocketManager) cleanupConnectionsLocked() {
+	// Unsubscribe from all subscriptions
+	for _, sub := range wsm.Subscriptions {
+		if sub != nil {
+			sub.Unsubscribe()
+		}
+	}
+	wsm.Subscriptions = nil
+
+	// Close WebSocket client
+	if wsm.WsClient != nil {
+		wsm.WsClient.Close()
+		wsm.WsClient = nil
+	}
+}
+
+// monitorAndReconnect monitors the connection and reconnects if necessary
+func (wsm *WebSocketManager) monitorAndReconnect() {
+	for {
+		// Wait for shutdown signal or reconnection trigger
+		select {
+		case <-wsm.ShutdownChan:
+			return
+		case <-wsm.reconnectChan:
+			// Try to connect
+			err := wsm.connect()
+			if err != nil {
+				fmt.Printf("Failed to connect to WebSocket: %v. Retrying in %v...\n", err, wsm.ReconnectInterval)
+				// Schedule another reconnection attempt
+				time.AfterFunc(wsm.ReconnectInterval, wsm.triggerReconnect)
+			}
+		}
+	}
+}
+
+// connect establishes a WebSocket connection and sets up subscriptions
+func (wsm *WebSocketManager) connect() error {
+	wsm.Mutex.Lock()
+	defer wsm.Mutex.Unlock()
+
+	// Check if we're still running
+	if !wsm.Running {
+		return fmt.Errorf("WebSocketManager is no longer running")
+	}
+
+	// Clean up existing connections
+	wsm.cleanupConnectionsLocked()
+
+	// Create a new WebSocket client
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var err error
+	wsm.WsClient, err = ws.Connect(ctx, wsm.WsURL)
+	if err != nil {
+		return fmt.Errorf("failed to connect to WebSocket: %v", err)
+	}
+
+	// Create subscriptions for each wallet
+	wsm.Subscriptions = make([]*ws.LogSubscription, len(wsm.WalletPublicKeys))
+	for i, pubKey := range wsm.WalletPublicKeys {
+		fmt.Printf("Subscribing to logs for wallet: %s\n", pubKey.String())
+		sub, err := wsm.WsClient.LogsSubscribeMentions(
+			pubKey,
+			rpc.CommitmentConfirmed,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to subscribe to logs for wallet %s: %v", pubKey.String(), err)
+		}
+		wsm.Subscriptions[i] = sub
+
+		// Start a goroutine to handle notifications for this subscription
+		wsm.WgSubscriptions.Add(1)
+		go wsm.handleSubscription(sub, pubKey)
+	}
+
+	fmt.Println(color.GreenString("WebSocket connections established successfully"))
+	return nil
+}
+
+// handleSubscription handles a single subscription
+func (wsm *WebSocketManager) handleSubscription(sub *ws.LogSubscription, pubKey solana.PublicKey) {
+	defer wsm.WgSubscriptions.Done()
+
+	for {
+		// Create context with shutdown capability
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-wsm.ShutdownChan:
+				cancel()
+			case <-ctx.Done():
+				// Context already cancelled, do nothing
+			}
+		}()
+
+		notification, err := sub.Recv(ctx)
+		cancel() // Clean up the context
+
+		if err != nil {
+			select {
+			case <-wsm.ShutdownChan:
+				// If we're shutting down gracefully, don't log the error
+				return
+			default:
+				fmt.Printf("Error receiving notification for wallet %s: %v\n", pubKey.String(), err)
+				// Trigger reconnection only if we're not already shutting down
+				wsm.triggerReconnect()
+				return
+			}
+		}
+
+		// Check if we're shutting down
+		select {
+		case <-wsm.ShutdownChan:
+			return
+		default:
+			// Continue processing
+		}
+
+		// Send notification to the channel if we're still running
+		select {
+		case wsm.NotificationChan <- notification:
+			// Successfully sent notification
+		case <-wsm.ShutdownChan:
+			return
+		}
+	}
+}
+
+// ProcessNotifications processes notifications from the channel
+func (wsm *WebSocketManager) ProcessNotifications() {
+	// Create a semaphore to limit concurrent processing
+	const maxConcurrent = 50
+	semaphore := make(chan struct{}, maxConcurrent)
+
+	// Keep track of recently processed transactions to avoid duplicates
+	processedTxs := make(map[string]time.Time)
+	processMutex := sync.Mutex{}
+
+	// Start a goroutine to clean up old processed transactions
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				now := time.Now()
+				processMutex.Lock()
+				for sig, t := range processedTxs {
+					// Remove entries older than 30 minutes
+					if now.Sub(t) > 30*time.Minute {
+						delete(processedTxs, sig)
+					}
+				}
+				processMutex.Unlock()
+			case <-wsm.ShutdownChan:
+				return
+			}
+		}
+	}()
+
+	// Process notifications from the channel
+	for {
+		select {
+		case <-wsm.ShutdownChan:
+			return
+		case notification, ok := <-wsm.NotificationChan:
+			if !ok {
+				// Channel closed
+				return
+			}
+
+			signature := notification.Value.Signature
+
+			// Check if we've already processed this transaction
+			processMutex.Lock()
+			if _, exists := processedTxs[signature.String()]; exists {
+				fmt.Printf("Skipping already processed transaction: %s\n", signature)
+				processMutex.Unlock()
+				continue
+			}
+
+			// Mark as processed
+			processedTxs[signature.String()] = time.Now()
+			processMutex.Unlock()
+
+			fmt.Printf("Received notification for transaction: %s\n", signature)
+
+			// Acquire semaphore spot
+			semaphore <- struct{}{}
+
+			// Process transaction in a separate goroutine
+			go func(notification *ws.LogResult) {
+				defer func() {
+					// Release the semaphore when done
+					<-semaphore
+				}()
+
+				signature := notification.Value.Signature
+
+				retry := 1
+				maxRetries := 5
+				backoff := 10 * time.Second
+
+				for retry <= maxRetries {
+					// Check if we should continue processing
+					select {
+					case <-wsm.ShutdownChan:
+						return
+					default:
+						// Continue processing
+					}
+
+					swapInfo, err := ParseTxData(wsm.RpcClient, signature)
+					if err != nil {
+						fmt.Printf("Error parsing transaction data for %s: %v\n", signature, err)
+						if retry < maxRetries {
+							fmt.Printf("Retrying %s in %v seconds... (Attempt %d/%d)\n",
+								signature, backoff.Seconds(), retry, maxRetries)
+							retry++
+
+							// Use a separate context for the sleep to make it interruptible
+							sleepCtx, cancel := context.WithTimeout(context.Background(), backoff)
+							select {
+							case <-sleepCtx.Done():
+								cancel()
+							case <-wsm.ShutdownChan:
+								cancel()
+								return
+							}
+							cancel()
+
+							// Exponential backoff with a cap
+							backoff = time.Duration(float64(backoff) * 1.5)
+							if backoff > 30*time.Second {
+								backoff = 30 * time.Second
+							}
+
+							continue
+						}
+						fmt.Printf("Giving up on transaction %s after %d attempts\n",
+							signature, maxRetries)
+						return
+					}
+
+					WSOL := "So11111111111111111111111111111111111111112"
+					USDC := "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+					USDT := "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+
+					tradeType := "BUY"
+					if swapInfo.TokenOutMint.String() == WSOL || swapInfo.TokenOutMint.String() == USDC || swapInfo.TokenOutMint.String() == USDT {
+						tradeType = "SELL"
+					}
+
+					if swapInfo != nil {
+						// Process the swap info
+						transactionInfo := models.Trade{
+							Type:            tradeType,
+							DexProvider:     swapInfo.AMMs[0],
+							Timestamp:       time.Now().Unix(),
+							WalletAddress:   swapInfo.Signers[0].String(),
+							TokenInAddress:  swapInfo.TokenInMint.String(),
+							TokenOutAddress: swapInfo.TokenOutMint.String(),
+							TokenInAmount:   ParseTokenAmount(swapInfo.TokenInAmount, swapInfo.TokenInDecimals).String(),
+							TokenOutAmount:  ParseTokenAmount(swapInfo.TokenOutAmount, swapInfo.TokenOutDecimals).String(),
+							TxID:            signature.String(),
+						}
+
+						// Send the transaction to API
+						SendTransactionToAPI(wsm.ApiURL, transactionInfo)
+					}
+					break
+				}
+			}(notification)
+		}
+	}
+}
+
+// UpdateWallets updates the wallet list in the WebSocketManager
+func (wsm *WebSocketManager) UpdateWallets(walletPublicKeys []solana.PublicKey) {
+	wsm.Mutex.Lock()
+	defer wsm.Mutex.Unlock()
+
+	wsm.WalletPublicKeys = walletPublicKeys
+	fmt.Printf("Updated wallet list with %d wallets\n", len(walletPublicKeys))
+}
+
+// RefreshWallets periodically refreshes the list of wallets and websocket connections
+func RefreshWallets(wsManager *WebSocketManager) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			fmt.Println(color.YellowString("Refreshing wallet list and connections..."))
+
+			// Load updated wallets
+			newWallets := LoadWallets()
+
+			// Log wallet addresses for debugging
+			fmt.Printf("Refreshing with %d wallets\n", len(newWallets))
+			for i, wallet := range newWallets {
+				fmt.Printf("Wallet %d: %s\n", i+1, wallet.String())
+			}
+
+			// Stop current WebSocket Manager - this will clean up resources and connections
+			wsManager.Stop()
+
+			// Update wallets in the manager (even if they're the same)
+			wsManager.UpdateWallets(newWallets)
+
+			// Restart WebSocket Manager
+			err := wsManager.Start()
+			if err != nil {
+				log.Printf("Failed to restart WebSocket Manager: %v", err)
+				// Try again after a short delay
+				time.Sleep(5 * time.Second)
+				err = wsManager.Start()
+				if err != nil {
+					log.Printf("Second attempt to restart WebSocket Manager failed: %v", err)
+				}
+			} else {
+				fmt.Println(color.GreenString("Successfully refreshed websocket connections"))
+			}
+		}
+	}
+}
+
+// triggerReconnect signals that a reconnection should be attempted
+func (wsm *WebSocketManager) triggerReconnect() {
+	// Non-blocking send to reconnect channel
+	select {
+	case wsm.reconnectChan <- struct{}{}:
+		// Successfully sent reconnect signal
+	default:
+		// Channel is full, which means reconnect is already pending
+	}
+}

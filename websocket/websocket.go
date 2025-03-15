@@ -1,113 +1,18 @@
-package main
+package websocket
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"log"
-	"math"
-	"math/big"
-	"net/http"
-	"os"
-	"runtime"
-	"strconv"
 	"sync"
 	"time"
 
-	"github.com/fatih/color"
-	solanaswapgo "github.com/franco-bianco/solanaswap-go/solanaswap-go"
-	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
+
+	"github.com/fatih/color"
+	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc/ws"
-	"github.com/joho/godotenv"
-	"github.com/nikola43/solanatxtracker/db"
 	"github.com/nikola43/solanatxtracker/models"
 )
-
-// parseTokenAmount converts a token amount to a human-readable format
-func parseTokenAmount(amount uint64, decimals uint8) *big.Float {
-	amountFloat := new(big.Float).SetUint64(amount)
-	decimalFactor := new(big.Float).SetFloat64(math.Pow(10, float64(decimals)))
-	return new(big.Float).Quo(amountFloat, decimalFactor)
-}
-
-// parseTxData parses transaction data
-func parseTxData(rpcClient *rpc.Client, signature solana.Signature) (*solanaswapgo.SwapInfo, error) {
-	var maxTxVersion uint64 = 0
-	tx, err := rpcClient.GetTransaction(
-		context.TODO(),
-		signature,
-		&rpc.GetTransactionOpts{
-			Commitment:                     rpc.CommitmentFinalized,
-			MaxSupportedTransactionVersion: &maxTxVersion,
-		},
-	)
-
-	if err != nil {
-		fmt.Println("Error getting transaction: ", err)
-		return nil, err
-	}
-
-	parser, err := solanaswapgo.NewTransactionParser(tx)
-	if err != nil {
-		fmt.Println("error creating parser: ", err)
-		return nil, err
-	}
-
-	transactionData, err := parser.ParseTransaction()
-	if err != nil {
-		fmt.Println("error parsing transaction: ", err)
-		return nil, err
-	}
-
-	swapInfo, err := parser.ProcessSwapData(transactionData)
-	if err != nil {
-		fmt.Println("error processing swap data: ", err)
-		return nil, err
-	}
-
-	return swapInfo, nil
-}
-
-// sendTransactionToAPI sends transaction data to API
-func sendTransactionToAPI(apiURL string, transactionInfo models.Trade) {
-	requestBody, err := json.Marshal(transactionInfo)
-	if err != nil {
-		fmt.Println("Error marshalling JSON:", err)
-		return
-	}
-
-	// Create a new HTTP request
-	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(requestBody))
-	if err != nil {
-		fmt.Println("Error creating request:", err)
-		return
-	}
-
-	// Set headers
-	req.Header.Set("Content-Type", "application/json")
-
-	// Create an HTTP client and send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println("Error sending request:", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Read the response body
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Println("Error reading response:", err)
-		return
-	}
-
-	// Print the response
-	fmt.Printf("API Response for tx %s: %s\n", transactionInfo.TxID, string(body))
-}
 
 // WebSocketManager manages WebSocket connections and reconnections
 type WebSocketManager struct {
@@ -258,7 +163,7 @@ func (wsm *WebSocketManager) handleSubscription(sub *ws.LogSubscription, pubKey 
 		notification, err := sub.Recv(context.Background())
 		if err != nil {
 			fmt.Printf("Error receiving notification for wallet %s: %v\n", pubKey.String(), err)
-			
+
 			// Trigger reconnection by closing the connection
 			wsm.Mutex.Lock()
 			if wsm.WsClient != nil {
@@ -266,7 +171,7 @@ func (wsm *WebSocketManager) handleSubscription(sub *ws.LogSubscription, pubKey 
 				wsm.WsClient = nil
 			}
 			wsm.Mutex.Unlock()
-			
+
 			// Allow time for monitorAndReconnect to notice and start reconnection
 			time.Sleep(1 * time.Second)
 			return
@@ -305,7 +210,7 @@ func (wsm *WebSocketManager) ProcessNotifications() {
 				retry := 1
 				maxRetries := 5
 				for retry <= maxRetries {
-					swapInfo, err := parseTxData(wsm.RpcClient, signature)
+					swapInfo, err := ParseTxData(wsm.RpcClient, signature)
 					if err != nil {
 						fmt.Printf("Error parsing transaction data for %s: %v\n", signature, err)
 						if retry < maxRetries {
@@ -338,76 +243,17 @@ func (wsm *WebSocketManager) ProcessNotifications() {
 							WalletAddress:   swapInfo.Signers[0].String(),
 							TokenInAddress:  swapInfo.TokenInMint.String(),
 							TokenOutAddress: swapInfo.TokenOutMint.String(),
-							TokenInAmount:   parseTokenAmount(swapInfo.TokenInAmount, swapInfo.TokenInDecimals).String(),
-							TokenOutAmount:  parseTokenAmount(swapInfo.TokenOutAmount, swapInfo.TokenOutDecimals).String(),
+							TokenInAmount:   ParseTokenAmount(swapInfo.TokenInAmount, swapInfo.TokenInDecimals).String(),
+							TokenOutAmount:  ParseTokenAmount(swapInfo.TokenOutAmount, swapInfo.TokenOutDecimals).String(),
 							TxID:            signature.String(),
 						}
 
 						// Send the transaction to API
-						sendTransactionToAPI(wsm.ApiURL, transactionInfo)
+						SendTransactionToAPI(wsm.ApiURL, transactionInfo)
 					}
 					break
 				}
 			}(notification)
 		}
 	}
-}
-
-func main() {
-	// get environment variables
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
-	MYSQL_HOST := os.Getenv("MYSQL_HOST")
-	MYSQL_USER := os.Getenv("MYSQL_USER")
-	MYSQL_PASSWORD := os.Getenv("MYSQL_PASSWORD")
-	MYSQL_DATABASE := os.Getenv("MYSQL_DATABASE")
-	MYSQL_PORT := os.Getenv("MYSQL_PORT")
-	RPC_URL := os.Getenv("RPC_URL")
-	RPC_WS := os.Getenv("RPC_WS")
-	API_URL := os.Getenv("API_URL")
-
-	// system config
-	numCpu := runtime.NumCPU()
-	usedCpu := numCpu
-	runtime.GOMAXPROCS(usedCpu)
-	fmt.Println("")
-	fmt.Println(color.YellowString("  ----------------- System Info -----------------"))
-	fmt.Println(color.CyanString("\t    Number CPU cores available: "), color.GreenString(strconv.Itoa(numCpu)))
-	fmt.Println(color.MagentaString("\t    Used of CPU cores: "), color.YellowString(strconv.Itoa(usedCpu)))
-	fmt.Println(color.MagentaString(""))
-
-	// initialize database connection
-	db.InitializeDatabase(MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE, MYSQL_HOST, MYSQL_PORT, false)
-
-	// get all wallets
-	wallets := []models.Wallets{}
-	db.GormDB.Find(&wallets)
-	walletsPublicKeys := make([]solana.PublicKey, len(wallets))
-	for i, wallet := range wallets {
-		pubKey, err := solana.PublicKeyFromBase58(wallet.Address)
-		if err != nil {
-			log.Fatalf("Invalid wallet address: %v", err)
-		}
-		walletsPublicKeys[i] = pubKey
-	}
-
-	// Initialize WebSocket Manager
-	wsManager := NewWebSocketManager(RPC_URL, RPC_WS, API_URL, walletsPublicKeys)
-	
-	// Start the WebSocket Manager
-	err = wsManager.Start()
-	if err != nil {
-		log.Fatalf("Failed to start WebSocket Manager: %v", err)
-	}
-	
-	// Start processing notifications
-	go wsManager.ProcessNotifications()
-
-	// Wait for interrupt signal
-	fmt.Println(color.GreenString("Service running. Press Ctrl+C to stop."))
-	
-	// Wait forever (or until interrupted)
-	select {}
 }
