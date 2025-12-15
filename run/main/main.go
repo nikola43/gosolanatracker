@@ -5,15 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"math"
 	"math/big"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fatih/color"
@@ -26,6 +28,81 @@ import (
 	"github.com/nikola43/solanatxtracker/models"
 )
 
+// Config holds all application configuration
+type Config struct {
+	MySQLHost     string
+	MySQLUser     string
+	MySQLPassword string
+	MySQLDatabase string
+	MySQLPort     string
+	RPCURL        string
+	RPCWS         string
+	APIURL        string
+}
+
+// Well-known Solana token addresses
+const (
+	WSOL = "So11111111111111111111111111111111111111112"
+	USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+	USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+)
+
+// Default configuration values
+const (
+	DefaultReconnectInterval = 10 * time.Second
+	DefaultMaxRetries        = 10
+	DefaultMaxConcurrent     = 50
+	DefaultHTTPTimeout       = 30 * time.Second
+	DefaultWSConnectTimeout  = 30 * time.Second
+	DefaultParseRetryDelay   = 10 * time.Second
+	DefaultParseMaxRetries   = 5
+	NotificationBufferSize   = 100
+)
+
+// loadConfig loads and validates configuration from environment variables
+func loadConfig() (*Config, error) {
+	// Load .env file if it exists (optional in production)
+	if err := godotenv.Load(); err != nil {
+		log.Printf("Warning: .env file not found, using environment variables")
+	}
+
+	config := &Config{
+		MySQLHost:     os.Getenv("MYSQL_HOST"),
+		MySQLUser:     os.Getenv("MYSQL_USER"),
+		MySQLPassword: os.Getenv("MYSQL_PASSWORD"),
+		MySQLDatabase: os.Getenv("MYSQL_DATABASE"),
+		MySQLPort:     os.Getenv("MYSQL_PORT"),
+		RPCURL:        os.Getenv("RPC_URL"),
+		RPCWS:         os.Getenv("RPC_WS"),
+		APIURL:        os.Getenv("API_URL"),
+	}
+
+	// Validate required configuration
+	if config.MySQLHost == "" {
+		return nil, fmt.Errorf("MYSQL_HOST is required")
+	}
+	if config.MySQLUser == "" {
+		return nil, fmt.Errorf("MYSQL_USER is required")
+	}
+	if config.MySQLDatabase == "" {
+		return nil, fmt.Errorf("MYSQL_DATABASE is required")
+	}
+	if config.MySQLPort == "" {
+		config.MySQLPort = "3306" // Default MySQL port
+	}
+	if config.RPCURL == "" {
+		return nil, fmt.Errorf("RPC_URL is required")
+	}
+	if config.RPCWS == "" {
+		return nil, fmt.Errorf("RPC_WS is required")
+	}
+	if config.APIURL == "" {
+		return nil, fmt.Errorf("API_URL is required")
+	}
+
+	return config, nil
+}
+
 // parseTokenAmount converts a token amount to a human-readable format
 func parseTokenAmount(amount uint64, decimals uint8) *big.Float {
 	amountFloat := new(big.Float).SetUint64(amount)
@@ -33,381 +110,512 @@ func parseTokenAmount(amount uint64, decimals uint8) *big.Float {
 	return new(big.Float).Quo(amountFloat, decimalFactor)
 }
 
-// parseTxData parses transaction data
-func parseTxData(rpcClient *rpc.Client, signature solana.Signature) (*solanaswapgo.SwapInfo, error) {
+// parseTxData parses transaction data with proper context handling
+func parseTxData(ctx context.Context, rpcClient *rpc.Client, signature solana.Signature) (*solanaswapgo.SwapInfo, error) {
 	var maxTxVersion uint64 = 0
 	tx, err := rpcClient.GetTransaction(
-		context.TODO(),
+		ctx,
 		signature,
 		&rpc.GetTransactionOpts{
 			Commitment:                     rpc.CommitmentFinalized,
 			MaxSupportedTransactionVersion: &maxTxVersion,
 		},
 	)
-
 	if err != nil {
-		fmt.Println("Error getting transaction: ", err)
-		return nil, err
+		return nil, fmt.Errorf("error getting transaction: %w", err)
 	}
 
 	parser, err := solanaswapgo.NewTransactionParser(tx)
 	if err != nil {
-		fmt.Println("error creating parser: ", err)
-		return nil, err
+		return nil, fmt.Errorf("error creating parser: %w", err)
 	}
 
 	transactionData, err := parser.ParseTransaction()
 	if err != nil {
-		fmt.Println("error parsing transaction: ", err)
-		return nil, err
+		return nil, fmt.Errorf("error parsing transaction: %w", err)
 	}
 
 	swapInfo, err := parser.ProcessSwapData(transactionData)
 	if err != nil {
-		fmt.Println("error processing swap data: ", err)
-		return nil, err
+		return nil, fmt.Errorf("error processing swap data: %w", err)
 	}
 
 	return swapInfo, nil
 }
 
-// sendTransactionToAPI sends transaction data to API
-func sendTransactionToAPI(apiURL string, transactionInfo models.Trade) {
+// HTTPClient wraps http.Client with production-ready defaults
+type HTTPClient struct {
+	client *http.Client
+}
+
+// NewHTTPClient creates a new HTTP client with proper timeouts
+func NewHTTPClient() *HTTPClient {
+	return &HTTPClient{
+		client: &http.Client{
+			Timeout: DefaultHTTPTimeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
+	}
+}
+
+// sendTransactionToAPI sends transaction data to API with proper error handling
+func (hc *HTTPClient) sendTransactionToAPI(ctx context.Context, apiURL string, transactionInfo models.Trade) error {
 	requestBody, err := json.Marshal(transactionInfo)
 	if err != nil {
-		fmt.Println("Error marshalling JSON:", err)
-		return
+		return fmt.Errorf("error marshalling JSON: %w", err)
 	}
 
-	// Create a new HTTP request
-	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(requestBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(requestBody))
 	if err != nil {
-		fmt.Println("Error creating request:", err)
-		return
+		return fmt.Errorf("error creating request: %w", err)
 	}
 
-	// Set headers
 	req.Header.Set("Content-Type", "application/json")
 
-	// Create an HTTP client and send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := hc.client.Do(req)
 	if err != nil {
-		fmt.Println("Error sending request:", err)
-		return
+		return fmt.Errorf("error sending request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Read the response body
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Println("Error reading response:", err)
-		return
+		return fmt.Errorf("error reading response: %w", err)
 	}
 
-	// Print the response
-	fmt.Printf("API Response for tx %s: %s\n", transactionInfo.TxID, string(body))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("API returned non-success status %d: %s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("API Response for tx %s: %s", transactionInfo.TxID, string(body))
+	return nil
 }
 
 // WebSocketManager manages WebSocket connections and reconnections
 type WebSocketManager struct {
-	RpcURL            string
-	WsURL             string
-	ApiURL            string
-	WalletPublicKeys  []solana.PublicKey
-	NotificationChan  chan *ws.LogResult
-	RpcClient         *rpc.Client
-	WsClient          *ws.Client
-	Subscriptions     []*ws.LogSubscription
-	ShutdownChan      chan struct{}
-	ReconnectInterval time.Duration
-	MaxRetries        int
-	Mutex             sync.Mutex
-	Running           bool
+	rpcURL            string
+	wsURL             string
+	apiURL            string
+	walletPublicKeys  []solana.PublicKey
+	notificationChan  chan *ws.LogResult
+	rpcClient         *rpc.Client
+	wsClient          *ws.Client
+	subscriptions     []*ws.LogSubscription
+	shutdownChan      chan struct{}
+	reconnectInterval time.Duration
+	maxRetries        int
+	mutex             sync.RWMutex
+	running           bool
+	httpClient        *HTTPClient
+	wg                sync.WaitGroup
 }
 
 // NewWebSocketManager creates a new WebSocketManager
 func NewWebSocketManager(rpcURL, wsURL, apiURL string, walletPublicKeys []solana.PublicKey) *WebSocketManager {
 	return &WebSocketManager{
-		RpcURL:            rpcURL,
-		WsURL:             wsURL,
-		ApiURL:            apiURL,
-		WalletPublicKeys:  walletPublicKeys,
-		NotificationChan:  make(chan *ws.LogResult, 100), // Buffer size to prevent blocking
-		ShutdownChan:      make(chan struct{}),
-		ReconnectInterval: 10 * time.Second,
-		MaxRetries:        10,
-		Running:           false,
+		rpcURL:            rpcURL,
+		wsURL:             wsURL,
+		apiURL:            apiURL,
+		walletPublicKeys:  walletPublicKeys,
+		notificationChan:  make(chan *ws.LogResult, NotificationBufferSize),
+		shutdownChan:      make(chan struct{}),
+		reconnectInterval: DefaultReconnectInterval,
+		maxRetries:        DefaultMaxRetries,
+		running:           false,
+		httpClient:        NewHTTPClient(),
 	}
 }
 
 // Start starts the WebSocketManager
 func (wsm *WebSocketManager) Start() error {
-	wsm.Mutex.Lock()
-	if wsm.Running {
-		wsm.Mutex.Unlock()
+	wsm.mutex.Lock()
+	if wsm.running {
+		wsm.mutex.Unlock()
 		return fmt.Errorf("WebSocketManager is already running")
 	}
-	wsm.Running = true
-	wsm.Mutex.Unlock()
+	wsm.running = true
+	wsm.mutex.Unlock()
 
-	wsm.RpcClient = rpc.New(wsm.RpcURL)
+	wsm.rpcClient = rpc.New(wsm.rpcURL)
 
 	// Start connection monitor
+	wsm.wg.Add(1)
 	go wsm.monitorAndReconnect()
 
 	return nil
 }
 
-// Stop stops the WebSocketManager
+// Stop stops the WebSocketManager gracefully
 func (wsm *WebSocketManager) Stop() {
-	wsm.Mutex.Lock()
-	defer wsm.Mutex.Unlock()
-
-	if !wsm.Running {
+	wsm.mutex.Lock()
+	if !wsm.running {
+		wsm.mutex.Unlock()
 		return
 	}
+	wsm.running = false
+	wsm.mutex.Unlock()
 
-	close(wsm.ShutdownChan)
+	close(wsm.shutdownChan)
 	wsm.cleanupConnections()
-	wsm.Running = false
+
+	// Wait for all goroutines to finish with timeout
+	done := make(chan struct{})
+	go func() {
+		wsm.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("WebSocketManager stopped gracefully")
+	case <-time.After(10 * time.Second):
+		log.Println("WebSocketManager stop timed out")
+	}
+}
+
+// IsRunning returns whether the manager is running
+func (wsm *WebSocketManager) IsRunning() bool {
+	wsm.mutex.RLock()
+	defer wsm.mutex.RUnlock()
+	return wsm.running
 }
 
 // cleanupConnections cleans up WebSocket connections
 func (wsm *WebSocketManager) cleanupConnections() {
-	// Unsubscribe from all subscriptions
-	for _, sub := range wsm.Subscriptions {
+	wsm.mutex.Lock()
+	defer wsm.mutex.Unlock()
+
+	for _, sub := range wsm.subscriptions {
 		if sub != nil {
 			sub.Unsubscribe()
 		}
 	}
-	wsm.Subscriptions = nil
+	wsm.subscriptions = nil
 
-	// Close WebSocket client
-	if wsm.WsClient != nil {
-		wsm.WsClient.Close()
-		wsm.WsClient = nil
+	if wsm.wsClient != nil {
+		wsm.wsClient.Close()
+		wsm.wsClient = nil
 	}
 }
 
 // monitorAndReconnect monitors the connection and reconnects if necessary
 func (wsm *WebSocketManager) monitorAndReconnect() {
+	defer wsm.wg.Done()
+
+	retryCount := 0
 	for {
-		// Try to connect
+		if !wsm.IsRunning() {
+			return
+		}
+
 		err := wsm.connect()
 		if err != nil {
-			fmt.Printf("Failed to connect to WebSocket: %v. Retrying in %v...\n", err, wsm.ReconnectInterval)
-			select {
-			case <-wsm.ShutdownChan:
+			retryCount++
+			if retryCount > wsm.maxRetries {
+				log.Printf("Max retries (%d) exceeded, giving up on WebSocket connection", wsm.maxRetries)
 				return
-			case <-time.After(wsm.ReconnectInterval):
+			}
+			log.Printf("Failed to connect to WebSocket (attempt %d/%d): %v. Retrying in %v...",
+				retryCount, wsm.maxRetries, err, wsm.reconnectInterval)
+
+			select {
+			case <-wsm.shutdownChan:
+				return
+			case <-time.After(wsm.reconnectInterval):
 				continue
 			}
 		}
 
-		// Wait for shutdown signal or reconnection trigger
-		select {
-		case <-wsm.ShutdownChan:
-			return
-		}
+		// Reset retry count on successful connection
+		retryCount = 0
+
+		// Wait for shutdown signal
+		<-wsm.shutdownChan
+		return
 	}
 }
 
 // connect establishes a WebSocket connection and sets up subscriptions
 func (wsm *WebSocketManager) connect() error {
-	wsm.Mutex.Lock()
-	defer wsm.Mutex.Unlock()
+	wsm.mutex.Lock()
+	defer wsm.mutex.Unlock()
 
 	// Clean up existing connections
-	wsm.cleanupConnections()
+	for _, sub := range wsm.subscriptions {
+		if sub != nil {
+			sub.Unsubscribe()
+		}
+	}
+	wsm.subscriptions = nil
 
-	// Create a new WebSocket client
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if wsm.wsClient != nil {
+		wsm.wsClient.Close()
+		wsm.wsClient = nil
+	}
+
+	// Create a new WebSocket client with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultWSConnectTimeout)
 	defer cancel()
 
 	var err error
-	wsm.WsClient, err = ws.Connect(ctx, wsm.WsURL)
+	wsm.wsClient, err = ws.Connect(ctx, wsm.wsURL)
 	if err != nil {
-		return fmt.Errorf("failed to connect to WebSocket: %v", err)
+		return fmt.Errorf("failed to connect to WebSocket: %w", err)
 	}
 
 	// Create subscriptions for each wallet
-	wsm.Subscriptions = make([]*ws.LogSubscription, len(wsm.WalletPublicKeys))
-	for i, pubKey := range wsm.WalletPublicKeys {
-		fmt.Printf("Subscribing to logs for wallet: %s\n", pubKey.String())
-		sub, err := wsm.WsClient.LogsSubscribeMentions(
+	wsm.subscriptions = make([]*ws.LogSubscription, len(wsm.walletPublicKeys))
+	for i, pubKey := range wsm.walletPublicKeys {
+		log.Printf("Subscribing to logs for wallet: %s", pubKey.String())
+		sub, err := wsm.wsClient.LogsSubscribeMentions(
 			pubKey,
 			rpc.CommitmentConfirmed,
 		)
 		if err != nil {
-			return fmt.Errorf("failed to subscribe to logs for wallet %s: %v", pubKey.String(), err)
+			return fmt.Errorf("failed to subscribe to logs for wallet %s: %w", pubKey.String(), err)
 		}
-		wsm.Subscriptions[i] = sub
+		wsm.subscriptions[i] = sub
 
 		// Start a goroutine to handle notifications for this subscription
+		wsm.wg.Add(1)
 		go wsm.handleSubscription(sub, pubKey)
 	}
 
-	fmt.Println(color.GreenString("WebSocket connections established successfully"))
+	log.Println(color.GreenString("WebSocket connections established successfully"))
 	return nil
 }
 
 // handleSubscription handles a single subscription
 func (wsm *WebSocketManager) handleSubscription(sub *ws.LogSubscription, pubKey solana.PublicKey) {
-	for {
-		notification, err := sub.Recv(context.Background())
-		if err != nil {
-			fmt.Printf("Error receiving notification for wallet %s: %v\n", pubKey.String(), err)
-			
-			// Trigger reconnection by closing the connection
-			wsm.Mutex.Lock()
-			if wsm.WsClient != nil {
-				wsm.WsClient.Close()
-				wsm.WsClient = nil
-			}
-			wsm.Mutex.Unlock()
-			
-			// Allow time for monitorAndReconnect to notice and start reconnection
-			time.Sleep(1 * time.Second)
-			return
-		}
+	defer wsm.wg.Done()
 
-		// Send notification to the channel
-		wsm.NotificationChan <- notification
+	for {
+		select {
+		case <-wsm.shutdownChan:
+			return
+		default:
+			notification, err := sub.Recv(context.Background())
+			if err != nil {
+				if !wsm.IsRunning() {
+					return
+				}
+				log.Printf("Error receiving notification for wallet %s: %v", pubKey.String(), err)
+
+				// Trigger reconnection by closing the connection
+				wsm.mutex.Lock()
+				if wsm.wsClient != nil {
+					wsm.wsClient.Close()
+					wsm.wsClient = nil
+				}
+				wsm.mutex.Unlock()
+
+				// Give time for reconnection to happen
+				time.Sleep(1 * time.Second)
+				return
+			}
+
+			// Send notification to the channel (non-blocking with timeout)
+			select {
+			case wsm.notificationChan <- notification:
+			case <-time.After(5 * time.Second):
+				log.Printf("Warning: notification channel full, dropping notification for tx: %s",
+					notification.Value.Signature)
+			case <-wsm.shutdownChan:
+				return
+			}
+		}
 	}
 }
 
 // ProcessNotifications processes notifications from the channel
-func (wsm *WebSocketManager) ProcessNotifications() {
-	// Create a semaphore to limit concurrent processing
-	const maxConcurrent = 50
-	semaphore := make(chan struct{}, maxConcurrent)
+func (wsm *WebSocketManager) ProcessNotifications(ctx context.Context) {
+	semaphore := make(chan struct{}, DefaultMaxConcurrent)
 
-	// Process notifications from the channel
 	for {
 		select {
-		case <-wsm.ShutdownChan:
+		case <-ctx.Done():
 			return
-		case notification := <-wsm.NotificationChan:
+		case <-wsm.shutdownChan:
+			return
+		case notification := <-wsm.notificationChan:
 			// Acquire semaphore spot
-			semaphore <- struct{}{}
+			select {
+			case semaphore <- struct{}{}:
+			case <-ctx.Done():
+				return
+			case <-wsm.shutdownChan:
+				return
+			}
 
-			// Process transaction in a separate goroutine
+			wsm.wg.Add(1)
 			go func(notification *ws.LogResult) {
-				defer func() {
-					// Release the semaphore when done
-					<-semaphore
-				}()
+				defer wsm.wg.Done()
+				defer func() { <-semaphore }()
 
-				signature := notification.Value.Signature
-				fmt.Printf("Received notification for transaction: %s\n", signature)
-
-				retry := 1
-				maxRetries := 5
-				for retry <= maxRetries {
-					swapInfo, err := parseTxData(wsm.RpcClient, signature)
-					if err != nil {
-						fmt.Printf("Error parsing transaction data for %s: %v\n", signature, err)
-						if retry < maxRetries {
-							fmt.Printf("Retrying %s in 10 seconds... (Attempt %d/%d)\n",
-								signature, retry, maxRetries)
-							retry++
-							time.Sleep(10 * time.Second)
-							continue
-						}
-						fmt.Printf("Giving up on transaction %s after %d attempts\n",
-							signature, maxRetries)
-						return
-					}
-
-					WSOL := "So11111111111111111111111111111111111111112"
-					USDC := "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-					USDT := "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-
-					tradeType := "BUY"
-					if swapInfo.TokenOutMint.String() == WSOL || swapInfo.TokenOutMint.String() == USDC || swapInfo.TokenOutMint.String() == USDT {
-						tradeType = "SELL"
-					}
-
-					if swapInfo != nil {
-						// Process the swap info
-						transactionInfo := models.Trade{
-							Type:            tradeType,
-							DexProvider:     swapInfo.AMMs[0],
-							Timestamp:       time.Now().Unix(),
-							WalletAddress:   swapInfo.Signers[0].String(),
-							TokenInAddress:  swapInfo.TokenInMint.String(),
-							TokenOutAddress: swapInfo.TokenOutMint.String(),
-							TokenInAmount:   parseTokenAmount(swapInfo.TokenInAmount, swapInfo.TokenInDecimals).String(),
-							TokenOutAmount:  parseTokenAmount(swapInfo.TokenOutAmount, swapInfo.TokenOutDecimals).String(),
-							TxID:            signature.String(),
-						}
-
-						// Send the transaction to API
-						sendTransactionToAPI(wsm.ApiURL, transactionInfo)
-					}
-					break
-				}
+				wsm.processTransaction(ctx, notification)
 			}(notification)
 		}
 	}
 }
 
-func main() {
-	// get environment variables
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
+// processTransaction processes a single transaction notification
+func (wsm *WebSocketManager) processTransaction(ctx context.Context, notification *ws.LogResult) {
+	signature := notification.Value.Signature
+	log.Printf("Received notification for transaction: %s", signature)
+
+	for retry := 1; retry <= DefaultParseMaxRetries; retry++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-wsm.shutdownChan:
+			return
+		default:
+		}
+
+		swapInfo, err := parseTxData(ctx, wsm.rpcClient, signature)
+		if err != nil {
+			log.Printf("Error parsing transaction data for %s: %v", signature, err)
+			if retry < DefaultParseMaxRetries {
+				log.Printf("Retrying %s in %v... (Attempt %d/%d)",
+					signature, DefaultParseRetryDelay, retry, DefaultParseMaxRetries)
+				select {
+				case <-time.After(DefaultParseRetryDelay):
+					continue
+				case <-ctx.Done():
+					return
+				case <-wsm.shutdownChan:
+					return
+				}
+			}
+			log.Printf("Giving up on transaction %s after %d attempts", signature, DefaultParseMaxRetries)
+			return
+		}
+
+		if swapInfo == nil {
+			log.Printf("No swap info found for transaction %s", signature)
+			return
+		}
+
+		// Determine trade type
+		tradeType := "BUY"
+		tokenOut := swapInfo.TokenOutMint.String()
+		if tokenOut == WSOL || tokenOut == USDC || tokenOut == USDT {
+			tradeType = "SELL"
+		}
+
+		// Validate AMMs array
+		if len(swapInfo.AMMs) == 0 {
+			log.Printf("Warning: No AMM found for transaction %s", signature)
+			return
+		}
+
+		// Validate Signers array
+		if len(swapInfo.Signers) == 0 {
+			log.Printf("Warning: No signer found for transaction %s", signature)
+			return
+		}
+
+		transactionInfo := models.Trade{
+			Type:            tradeType,
+			DexProvider:     swapInfo.AMMs[0],
+			Timestamp:       time.Now().Unix(),
+			WalletAddress:   swapInfo.Signers[0].String(),
+			TokenInAddress:  swapInfo.TokenInMint.String(),
+			TokenOutAddress: swapInfo.TokenOutMint.String(),
+			TokenInAmount:   parseTokenAmount(swapInfo.TokenInAmount, swapInfo.TokenInDecimals).String(),
+			TokenOutAmount:  parseTokenAmount(swapInfo.TokenOutAmount, swapInfo.TokenOutDecimals).String(),
+			TxID:            signature.String(),
+		}
+
+		if err := wsm.httpClient.sendTransactionToAPI(ctx, wsm.apiURL, transactionInfo); err != nil {
+			log.Printf("Error sending transaction to API: %v", err)
+		}
+		return
 	}
-	MYSQL_HOST := os.Getenv("MYSQL_HOST")
-	MYSQL_USER := os.Getenv("MYSQL_USER")
-	MYSQL_PASSWORD := os.Getenv("MYSQL_PASSWORD")
-	MYSQL_DATABASE := os.Getenv("MYSQL_DATABASE")
-	MYSQL_PORT := os.Getenv("MYSQL_PORT")
-	RPC_URL := os.Getenv("RPC_URL")
-	RPC_WS := os.Getenv("RPC_WS")
-	API_URL := os.Getenv("API_URL")
+}
 
-	// system config
-	numCpu := runtime.NumCPU()
-	usedCpu := numCpu
-	runtime.GOMAXPROCS(usedCpu)
-	fmt.Println("")
+func main() {
+	// Load configuration
+	config, err := loadConfig()
+	if err != nil {
+		log.Fatalf("Configuration error: %v", err)
+	}
+
+	// System info
+	numCPU := runtime.NumCPU()
+	runtime.GOMAXPROCS(numCPU)
+
+	fmt.Println()
 	fmt.Println(color.YellowString("  ----------------- System Info -----------------"))
-	fmt.Println(color.CyanString("\t    Number CPU cores available: "), color.GreenString(strconv.Itoa(numCpu)))
-	fmt.Println(color.MagentaString("\t    Used of CPU cores: "), color.YellowString(strconv.Itoa(usedCpu)))
-	fmt.Println(color.MagentaString(""))
+	fmt.Println(color.CyanString("\t    Number CPU cores available: "), color.GreenString(strconv.Itoa(numCPU)))
+	fmt.Println(color.MagentaString("\t    Used CPU cores: "), color.YellowString(strconv.Itoa(numCPU)))
+	fmt.Println()
 
-	// initialize database connection
-	db.InitializeDatabase(MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE, MYSQL_HOST, MYSQL_PORT, false)
+	// Initialize database connection
+	if err := db.InitializeDatabase(
+		config.MySQLUser,
+		config.MySQLPassword,
+		config.MySQLDatabase,
+		config.MySQLHost,
+		config.MySQLPort,
+		false,
+	); err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	defer db.Close()
 
-	// get all wallets
-	wallets := []models.Wallets{}
-	db.GormDB.Find(&wallets)
-	walletsPublicKeys := make([]solana.PublicKey, len(wallets))
-	for i, wallet := range wallets {
+	// Get all wallets
+	var wallets []models.Wallets
+	if err := db.GormDB.Find(&wallets).Error; err != nil {
+		log.Fatalf("Failed to fetch wallets: %v", err)
+	}
+
+	if len(wallets) == 0 {
+		log.Println("Warning: No wallets found in database. Add wallets to start tracking.")
+	}
+
+	walletPublicKeys := make([]solana.PublicKey, 0, len(wallets))
+	for _, wallet := range wallets {
 		pubKey, err := solana.PublicKeyFromBase58(wallet.Address)
 		if err != nil {
-			log.Fatalf("Invalid wallet address: %v", err)
+			log.Printf("Warning: Invalid wallet address %s: %v", wallet.Address, err)
+			continue
 		}
-		walletsPublicKeys[i] = pubKey
+		walletPublicKeys = append(walletPublicKeys, pubKey)
 	}
 
 	// Initialize WebSocket Manager
-	wsManager := NewWebSocketManager(RPC_URL, RPC_WS, API_URL, walletsPublicKeys)
-	
+	wsManager := NewWebSocketManager(config.RPCURL, config.RPCWS, config.APIURL, walletPublicKeys)
+
 	// Start the WebSocket Manager
-	err = wsManager.Start()
-	if err != nil {
+	if err := wsManager.Start(); err != nil {
 		log.Fatalf("Failed to start WebSocket Manager: %v", err)
 	}
-	
+
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Start processing notifications
-	go wsManager.ProcessNotifications()
+	go wsManager.ProcessNotifications(ctx)
+
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	fmt.Println(color.GreenString("Service running. Press Ctrl+C to stop."))
 
 	// Wait for interrupt signal
-	fmt.Println(color.GreenString("Service running. Press Ctrl+C to stop."))
-	
-	// Wait forever (or until interrupted)
-	select {}
+	sig := <-sigChan
+	log.Printf("Received signal %v, shutting down gracefully...", sig)
+
+	// Cancel context and stop manager
+	cancel()
+	wsManager.Stop()
+
+	log.Println("Service stopped")
 }

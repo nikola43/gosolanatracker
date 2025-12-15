@@ -1,20 +1,19 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math"
 	"math/big"
-	"net/http"
+	"os"
 	"time"
 
 	solanaswapgo "github.com/franco-bianco/solanaswap-go/solanaswap-go"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
+	"github.com/joho/godotenv"
 	"github.com/nikola43/solanatxtracker/models"
 )
 
@@ -33,16 +32,10 @@ Example Transactions:
 - Rayd Concentrated Liquidity Swap: 4MSVpVBwxnYTQSF3bSrAB99a3pVr6P6bgoCRDsrBbDMA77WeQqoBDDDXqEh8WpnUy5U4GeotdCG9xyExjNTjYE1u
 - Maestro: mWaH4FELcPj4zeY4Cgk5gxUirQDM7yE54VgMEVaqiUDQjStyzwNrxLx4FMEaKEHQoYsgCRhc1YdmBvhGDRVgRrq
 - Meteora Pools Program: 4uuw76SPksFw6PvxLFkG9jRyReV1F4EyPYNc3DdSECip8tM22ewqGWJUaRZ1SJEZpuLJz1qPTEPb2es8Zuegng9Z
-- Moonshot: AhiFQX1Z3VYbkKQH64ryPDRwxUv8oEPzQVjSvT7zY58UYDm4Yvkkt2Ee9VtSXtF6fJz8fXmb5j3xYVDF17Gr9CG (Buy)
-- Moonshot: 2XYu86VrUXiwNNj8WvngcXGytrCsSrpay69Rt3XBz9YZvCQcZJLjvDfh9UWETFtFW47vi4xG2CkiarRJwSe6VekE (Sell)
-- Multiple AMMs: 46Jp5EEUrmdCVcE3jeewqUmsMHhqiWWtj243UZNDFZ3mmma6h2DF4AkgPE9ToRYVLVrfKQCJphrvxbNk68Lub9vw //! not supported yet
+- Moonshot Buy: AhiFQX1Z3VYbkKQH64ryPDRwxUv8oEPzQVjSvT7zY58UYDm4Yvkkt2Ee9VtSXtF6fJz8fXmb5j3xYVDF17Gr9CG
+- Moonshot Sell: 2XYu86VrUXiwNNj8WvngcXGytrCsSrpay69Rt3XBz9YZvCQcZJLjvDfh9UWETFtFW47vi4xG2CkiarRJwSe6VekE
+- Multiple AMMs: 46Jp5EEUrmdCVcE3jeewqUmsMHhqiWWtj243UZNDFZ3mmma6h2DF4AkgPE9ToRYVLVrfKQCJphrvxbNk68Lub9vw (not supported yet)
 - OKX: 5xaT2SXQUyvyLGsnyyoKMwsDoHrx1enCKofkdRMdNaL5MW26gjQBM3AWebwjTJ49uqEqnFu5d9nXJek6gUSGCqbL
-*/
-
-/*
-   const rpcUrl = 'https://mainnet.helius-rpc.com/?api-key=304dc492-1e7b-4f7b-95ea-463d23f83465';
-   const connection = new Connection(rpcUrl);
-   const signature = "DWvnsRwJYcBFeZ1d3heyjGcfjhwtBLK3BY4jxDpikxZcTTrKNJFTYghJgVxQNGJGSNT2Td8iD2kKXyUsYDYWpju"
 */
 
 func parseTokenAmount(amount uint64, decimals uint8) *big.Float {
@@ -52,12 +45,36 @@ func parseTokenAmount(amount uint64, decimals uint8) *big.Float {
 }
 
 func main() {
-	rpcClient := rpc.New(rpc.MainNetBeta.RPC)
-	signature := solana.MustSignatureFromBase58("4MAEMzMNjDB2fSdMmXwLKevEHJvN7zQz9GuKKyZrbcFuHW4AbpUDUEta1VNemGegUckTibdUwNt85fhzwhWFqvAD")
+	// Load environment variables
+	if err := godotenv.Load("../../.env"); err != nil {
+		log.Printf("Warning: .env file not found, using environment variables")
+	}
+
+	// Get RPC URL from environment or use default mainnet
+	rpcURL := os.Getenv("RPC_URL")
+	if rpcURL == "" {
+		rpcURL = rpc.MainNetBeta.RPC
+		log.Printf("RPC_URL not set, using default mainnet: %s", rpcURL)
+	}
+
+	// Get signature from command line or use default
+	signatureStr := "4MAEMzMNjDB2fSdMmXwLKevEHJvN7zQz9GuKKyZrbcFuHW4AbpUDUEta1VNemGegUckTibdUwNt85fhzwhWFqvAD"
+	if len(os.Args) > 1 {
+		signatureStr = os.Args[1]
+	}
+
+	rpcClient := rpc.New(rpcURL)
+	signature := solana.MustSignatureFromBase58(signatureStr)
+
+	fmt.Printf("Parsing transaction: %s\n", signature.String())
+	fmt.Printf("Using RPC: %s\n\n", rpcURL)
 
 	var maxTxVersion uint64 = 0
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	tx, err := rpcClient.GetTransaction(
-		context.TODO(),
+		ctx,
 		signature,
 		&rpc.GetTransactionOpts{
 			Commitment:                     rpc.CommitmentConfirmed,
@@ -65,32 +82,45 @@ func main() {
 		},
 	)
 	if err != nil {
-		log.Fatalf("error getting tx: %s", err)
+		log.Fatalf("Error getting transaction: %s", err)
 	}
 
 	parser, err := solanaswapgo.NewTransactionParser(tx)
 	if err != nil {
-		log.Fatalf("error creating parser: %s", err)
+		log.Fatalf("Error creating parser: %s", err)
 	}
 
 	transactionData, err := parser.ParseTransaction()
 	if err != nil {
-		log.Fatalf("error parsing transaction: %s", err)
+		log.Fatalf("Error parsing transaction: %s", err)
 	}
 
+	fmt.Println("=== Raw Transaction Data ===")
 	marshalledData, _ := json.MarshalIndent(transactionData, "", "  ")
 	fmt.Println(string(marshalledData))
 
 	swapInfo, err := parser.ProcessSwapData(transactionData)
 	if err != nil {
-		log.Fatalf("error processing swap data: %s", err)
+		log.Fatalf("Error processing swap data: %s", err)
 	}
 
+	fmt.Println("\n=== Processed Swap Info ===")
 	marshalledSwapData, _ := json.MarshalIndent(swapInfo, "", "  ")
 	fmt.Println(string(marshalledSwapData))
 
+	// Determine trade type
+	WSOL := "So11111111111111111111111111111111111111112"
+	USDC := "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+	USDT := "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+
+	tradeType := "BUY"
+	tokenOut := swapInfo.TokenOutMint.String()
+	if tokenOut == WSOL || tokenOut == USDC || tokenOut == USDT {
+		tradeType = "SELL"
+	}
+
 	transactionInfo := models.Trade{
-		Type:            ".",
+		Type:            tradeType,
 		DexProvider:     swapInfo.AMMs[0],
 		Timestamp:       time.Now().Unix(),
 		WalletAddress:   swapInfo.Signers[0].String(),
@@ -101,42 +131,7 @@ func main() {
 		TxID:            signature.String(),
 	}
 
+	fmt.Println("\n=== Trade Info ===")
 	unmarshalledSwapData, _ := json.MarshalIndent(transactionInfo, "", "  ")
 	fmt.Println(string(unmarshalledSwapData))
-
-	requestBody, err := json.Marshal(transactionInfo)
-	if err != nil {
-		fmt.Println("Error marshalling JSON:", err)
-		return
-	}
-
-	// insert transaction to API
-	// Create a new HTTP request
-	req, err := http.NewRequest("POST", "http://206.189.112.196/api/newTrade?api_key=CryptoCloudAI", bytes.NewBuffer(requestBody))
-	if err != nil {
-		fmt.Println("Error creating request:", err)
-		return
-	}
-
-	// Set headers
-	req.Header.Set("Content-Type", "application/json")
-
-	// Create an HTTP client and send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println("Error sending request:", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Read the response body
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Println("Error reading response:", err)
-		return
-	}
-
-	// Print the response
-	fmt.Println("Response:", string(body))
 }
